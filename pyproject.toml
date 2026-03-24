@@ -40,10 +40,11 @@ dependencies = [
 
 [project.optional-dependencies]
 onnx = ["onnxruntime"]
-onnx-gpu = ["onnxruntime-gpu"]
-onnx-openvino = ["onnxruntime-openvino"]
-onnx-directml = ["onnxruntime-directml"]
-onnx-qnn = ["onnxruntime-qnn"]
+onnx-macos = ["onnxruntime"]
+onnx-gpu = ["onnxruntime-gpu; sys_platform != 'darwin'"]
+# onnx-openvino = ["onnxruntime-openvino"]
+onnx-directml = ["onnxruntime-directml; sys_platform == 'win32'"]
+# onnx-qnn = ["onnxruntime-qnn"]
 train = [
     "ai-edge-litert",
     "albumentations",
