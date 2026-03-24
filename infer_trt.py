@@ -67,6 +67,10 @@ class TRTRunner:
             else:
                 self.output_names.append(name)
 
+    def _expected_torch_dtype(self, tensor_name: str) -> torch.dtype:
+        trt_dtype = self.engine.get_tensor_dtype(tensor_name)
+        return TRT_TO_TORCH_DTYPE.get(int(trt_dtype), torch.float32)
+
     def infer(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         """
         Run synchronous inference.
@@ -78,11 +82,12 @@ class TRTRunner:
             mapping of output tensor name → numpy array with results.
         """
         with torch.cuda.stream(self.stream):
-            # Upload inputs to GPU
+            # Upload inputs to GPU, casting to the dtype the engine expects
             d_inputs: dict[str, torch.Tensor] = {}
             for name, arr in inputs.items():
                 self.context.set_input_shape(name, arr.shape)
-                t = torch.from_numpy(arr).to(self.device, non_blocking=True)
+                expected_dtype = self._expected_torch_dtype(name)
+                t = torch.from_numpy(arr).to(dtype=expected_dtype, device=self.device, non_blocking=True)
                 d_inputs[name] = t.contiguous()
                 self.context.set_tensor_address(name, d_inputs[name].data_ptr())
 
