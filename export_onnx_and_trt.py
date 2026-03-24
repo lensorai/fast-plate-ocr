@@ -1,34 +1,36 @@
 #!/usr/bin/env python3
 """
-Export a fast-plate-ocr Keras model to ONNX and optionally build a TensorRT engine.
+Export a fast-plate-ocr Keras model to ONNX, and/or convert an ONNX model to TensorRT.
+
+Subcommands
+-----------
+  onnx    Keras (.keras) → ONNX (.onnx)
+  trt     ONNX  (.onnx)  → TensorRT (.engine)
 
 Usage examples
 --------------
-# ONNX only (channels-last, uint8 — matches default inference pipeline):
-python export_onnx_and_trt.py \
+# 1. Keras → ONNX (NHWC uint8, default):
+python export_onnx_and_trt.py onnx \
     --keras-model cct_s_v2_global.keras \
-    --plate-config config/latin_plate_config_v2.yaml \
-    --data-format channels_first \
-    --input-dtype float32
+    --plate-config cct_s_v2_global_plate_config.yaml
 
-# ONNX + TensorRT engine (FP16, NCHW for optimal TRT performance):
-python export_onnx_and_trt.py \
-    --keras-model cct_s_v2_global.keras \
-    --plate-config config/latin_plate_config_v2.yaml \
-    --data-format channels_first \
-    --input-dtype float32
-    --build-trt \
-    --trt-fp16
-
-# ONNX + TensorRT with custom batch profile:
-python export_onnx_and_trt.py \
+# 2. Keras → ONNX (NCHW float32, for TRT):
+python export_onnx_and_trt.py onnx \
     --keras-model cct_s_v2_global.keras \
     --plate-config cct_s_v2_global_plate_config.yaml \
-    --build-trt \
+    --data-format channels_first \
+    --input-dtype float32
+
+# 3. ONNX → TensorRT (FP16):
+python export_onnx_and_trt.py trt \
+    --onnx cct_s_v2_global.onnx \
+    --trt-fp16
+
+# 4. ONNX → TensorRT (custom batch profile):
+python export_onnx_and_trt.py trt \
+    --onnx cct_s_v2_global.onnx \
     --trt-fp16 \
-    --trt-min-batch 1 \
-    --trt-opt-batch 8 \
-    --trt-max-batch 32
+    --min-batch 1 --opt-batch 8 --max-batch 32
 """
 
 from __future__ import annotations
@@ -48,6 +50,11 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Keras → ONNX
+# ═══════════════════════════════════════════════════════════════════════════════
 
 
 def _load_keras_model(keras_path: pathlib.Path, plate_config_path: pathlib.Path):
@@ -143,6 +150,24 @@ def export_to_onnx(
     return out_onnx
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  ONNX → TensorRT
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+def _read_onnx_input_meta(onnx_path: pathlib.Path) -> tuple[str, tuple[int, ...]]:
+    """Return (input_name, spatial_dims) by inspecting the ONNX graph."""
+    import onnx
+
+    model = onnx.load(str(onnx_path), load_external_data=False)
+    inp = model.graph.input[0]
+    name = inp.name
+    dims = []
+    for d in inp.type.tensor_type.shape.dim:
+        dims.append(d.dim_value if d.dim_value > 0 else -1)
+    return name, tuple(dims[1:])
+
+
 def build_trt_engine(
     onnx_path: pathlib.Path,
     engine_path: pathlib.Path,
@@ -152,30 +177,23 @@ def build_trt_engine(
     min_batch: int = 1,
     opt_batch: int = 1,
     max_batch: int = 16,
+    workspace_gib: int = 2,
 ) -> pathlib.Path:
-    """
-    Build a TensorRT engine from an ONNX model.
-
-    Requires the ``tensorrt`` Python package (pip install tensorrt).
-    """
+    """Build a TensorRT engine from an ONNX model."""
     try:
         import tensorrt as trt
     except ImportError:
         log.error(
-            "tensorrt package not found. Install it with:\n"
-            "  pip install tensorrt\n"
-            "Or use trtexec CLI instead:\n"
-            "  trtexec --onnx=%s --saveEngine=%s %s",
-            onnx_path,
-            engine_path,
-            "--fp16" if fp16 else "",
+            "tensorrt package not found. Install with:\n"
+            "  pip install tensorrt          # or tensorrt-cu12 / tensorrt-cu12-bindings\n\n"
+            "Or use the trtexec CLI instead (no Python needed)."
         )
         sys.exit(1)
 
-    TRT_LOGGER = trt.Logger(trt.Logger.INFO)
-    builder = trt.Builder(TRT_LOGGER)
+    trt_logger = trt.Logger(trt.Logger.INFO)
+    builder = trt.Builder(trt_logger)
     network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
-    parser = trt.OnnxParser(network, TRT_LOGGER)
+    parser = trt.OnnxParser(network, trt_logger)
 
     log.info("Parsing ONNX model: %s", onnx_path)
     with open(onnx_path, "rb") as f:
@@ -185,22 +203,20 @@ def build_trt_engine(
             sys.exit(1)
 
     config = builder.create_builder_config()
-    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, 2 << 30)  # 2 GiB
+    config.set_memory_pool_limit(trt.MemoryPoolType.WORKSPACE, workspace_gib << 30)
 
     if fp16:
         if not builder.platform_has_fast_fp16:
-            log.warning("Platform does not have fast FP16 — enabling anyway.")
+            log.warning("Platform does not report fast FP16 — enabling anyway.")
         config.set_flag(trt.BuilderFlag.FP16)
         log.info("FP16 enabled.")
     if int8:
         config.set_flag(trt.BuilderFlag.INT8)
         log.info("INT8 enabled (you may need a calibrator for best accuracy).")
 
-    # Build optimization profile for the dynamic batch dimension
     input_tensor = network.get_input(0)
     input_name = input_tensor.name
-    input_shape = input_tensor.shape  # e.g. (-1, 64, 128, 3)
-    spatial_dims = tuple(input_shape[1:])
+    spatial_dims = tuple(input_tensor.shape[1:])
 
     profile = builder.create_optimization_profile()
     profile.set_shape(
@@ -211,11 +227,11 @@ def build_trt_engine(
     )
     config.add_optimization_profile(profile)
     log.info(
-        "TRT profile: input=%s  min_batch=%d  opt_batch=%d  max_batch=%d",
+        "Optimization profile: input='%s'  min=(%d, %s)  opt=(%d, %s)  max=(%d, %s)",
         input_name,
-        min_batch,
-        opt_batch,
-        max_batch,
+        min_batch, ", ".join(str(d) for d in spatial_dims),
+        opt_batch, ", ".join(str(d) for d in spatial_dims),
+        max_batch, ", ".join(str(d) for d in spatial_dims),
     )
 
     log.info("Building TensorRT engine (this may take a few minutes) ...")
@@ -228,7 +244,7 @@ def build_trt_engine(
     with open(engine_path, "wb") as f:
         f.write(serialized)
 
-    log.info("Saved TensorRT engine → %s", engine_path)
+    log.info("Saved TensorRT engine → %s  (%.1f MB)", engine_path, engine_path.stat().st_size / 1e6)
     return engine_path
 
 
@@ -240,10 +256,10 @@ def print_trtexec_command(
     min_batch: int,
     opt_batch: int,
     max_batch: int,
-    input_name: str = "input",
-    spatial: str = "64x128x3",
+    input_name: str,
+    spatial: str,
 ) -> None:
-    """Print the equivalent trtexec command for reference."""
+    """Print the equivalent trtexec CLI command for reference."""
     flags = ["--fp16"] if fp16 else []
     cmd = " \\\n    ".join(
         [
@@ -259,94 +275,108 @@ def print_trtexec_command(
     log.info("Equivalent trtexec command:\n\n  %s\n", cmd)
 
 
-def main() -> int:
-    p = argparse.ArgumentParser(
-        description="Export fast-plate-ocr Keras model to ONNX and optionally TensorRT.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CLI
+# ═══════════════════════════════════════════════════════════════════════════════
 
-    # --- Keras / ONNX args ---
-    p.add_argument("--keras-model", required=True, type=pathlib.Path, help="Path to .keras model file.")
-    p.add_argument("--plate-config", required=True, type=pathlib.Path, help="Path to plate_config.yaml.")
-    p.add_argument("--out-dir", type=pathlib.Path, default=None, help="Output directory (default: same as --keras-model).")
-    p.add_argument("--input-dtype", choices=["uint8", "float32"], default="uint8", help="ONNX input dtype (default: uint8).")
-    p.add_argument(
-        "--data-format",
-        choices=["channels_last", "channels_first"],
-        default="channels_last",
-        help="Input tensor layout. channels_first (NCHW) is preferred for TensorRT (default: channels_last).",
-    )
-    p.add_argument("--no-simplify", action="store_true", help="Skip onnxslim graph simplification.")
-    p.add_argument("--no-dynamic-batch", action="store_true", help="Use static batch=1 instead of dynamic.")
-    p.add_argument("--opset", type=int, default=None, help="ONNX opset version (default: Keras default).")
 
-    # --- TensorRT args ---
-    p.add_argument("--build-trt", action="store_true", help="Also build a TensorRT .engine file from the ONNX model.")
-    p.add_argument("--trt-fp16", action="store_true", help="Enable FP16 precision for TRT engine.")
-    p.add_argument("--trt-int8", action="store_true", help="Enable INT8 precision for TRT engine (needs calibrator for best results).")
-    p.add_argument("--trt-min-batch", type=int, default=1, help="TRT profile: minimum batch size (default: 1).")
-    p.add_argument("--trt-opt-batch", type=int, default=1, help="TRT profile: optimal batch size (default: 1).")
-    p.add_argument("--trt-max-batch", type=int, default=16, help="TRT profile: maximum batch size (default: 16).")
-
-    args = p.parse_args()
-
+def _cmd_onnx(args: argparse.Namespace) -> int:
     keras_path: pathlib.Path = args.keras_model.resolve()
     config_path: pathlib.Path = args.plate_config.resolve()
     out_dir = (args.out_dir or keras_path.parent).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    out_onnx = out_dir / f"{keras_path.stem}.onnx"
 
-    stem = keras_path.stem
-    onnx_path = out_dir / f"{stem}.onnx"
-    engine_path = out_dir / f"{stem}.engine"
-
-    # ── Step 1: Keras → ONNX ──
     export_to_onnx(
         keras_path,
         config_path,
-        onnx_path,
+        out_onnx,
         input_dtype=args.input_dtype,
         data_format=args.data_format,
         dynamic_batch=not args.no_dynamic_batch,
         simplify=not args.no_simplify,
         opset_version=args.opset,
     )
-
-    # ── Step 2 (optional): ONNX → TensorRT ──
-    if args.build_trt:
-        import yaml
-
-        with open(config_path) as f:
-            cfg = yaml.safe_load(f)
-
-        h, w = cfg["img_height"], cfg["img_width"]
-        c = 3 if cfg.get("image_color_mode", "grayscale") == "rgb" else 1
-        if args.data_format == "channels_first":
-            spatial = f"{c}x{h}x{w}"
-        else:
-            spatial = f"{h}x{w}x{c}"
-
-        print_trtexec_command(
-            onnx_path,
-            engine_path,
-            fp16=args.trt_fp16,
-            min_batch=args.trt_min_batch,
-            opt_batch=args.trt_opt_batch,
-            max_batch=args.trt_max_batch,
-            spatial=spatial,
-        )
-
-        build_trt_engine(
-            onnx_path,
-            engine_path,
-            fp16=args.trt_fp16,
-            int8=args.trt_int8,
-            min_batch=args.trt_min_batch,
-            opt_batch=args.trt_opt_batch,
-            max_batch=args.trt_max_batch,
-        )
-
-    log.info("Done.")
     return 0
+
+
+def _cmd_trt(args: argparse.Namespace) -> int:
+    onnx_path: pathlib.Path = args.onnx.resolve()
+    if not onnx_path.is_file():
+        log.error("ONNX file not found: %s", onnx_path)
+        return 1
+
+    engine_path = (args.engine or onnx_path.with_suffix(".engine")).resolve()
+
+    input_name, spatial_dims = _read_onnx_input_meta(onnx_path)
+    spatial_str = "x".join(str(d) for d in spatial_dims)
+    log.info("ONNX input: name='%s'  shape=(N, %s)", input_name, ", ".join(str(d) for d in spatial_dims))
+
+    print_trtexec_command(
+        onnx_path,
+        engine_path,
+        fp16=args.trt_fp16,
+        min_batch=args.min_batch,
+        opt_batch=args.opt_batch,
+        max_batch=args.max_batch,
+        input_name=input_name,
+        spatial=spatial_str,
+    )
+
+    build_trt_engine(
+        onnx_path,
+        engine_path,
+        fp16=args.trt_fp16,
+        int8=args.trt_int8,
+        min_batch=args.min_batch,
+        opt_batch=args.opt_batch,
+        max_batch=args.max_batch,
+        workspace_gib=args.workspace_gib,
+    )
+    return 0
+
+
+def main() -> int:
+    p = argparse.ArgumentParser(
+        description="Export plate-OCR models: Keras → ONNX and/or ONNX → TensorRT.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # ── onnx subcommand ──
+    onnx_p = sub.add_parser("onnx", help="Convert a Keras model to ONNX.")
+    onnx_p.add_argument("--keras-model", required=True, type=pathlib.Path, help="Path to .keras model file.")
+    onnx_p.add_argument("--plate-config", required=True, type=pathlib.Path, help="Path to plate_config.yaml.")
+    onnx_p.add_argument("--out-dir", type=pathlib.Path, default=None, help="Output directory (default: same as --keras-model).")
+    onnx_p.add_argument("--input-dtype", choices=["uint8", "float32"], default="uint8", help="ONNX input dtype (default: uint8).")
+    onnx_p.add_argument(
+        "--data-format",
+        choices=["channels_last", "channels_first"],
+        default="channels_last",
+        help="Input layout: channels_last (NHWC) or channels_first (NCHW). Default: channels_last.",
+    )
+    onnx_p.add_argument("--no-simplify", action="store_true", help="Skip onnxslim graph simplification.")
+    onnx_p.add_argument("--no-dynamic-batch", action="store_true", help="Use static batch=1 instead of dynamic.")
+    onnx_p.add_argument("--opset", type=int, default=None, help="ONNX opset version (default: Keras default).")
+
+    # ── trt subcommand ──
+    trt_p = sub.add_parser("trt", help="Convert an ONNX model to a TensorRT engine.")
+    trt_p.add_argument("--onnx", required=True, type=pathlib.Path, help="Path to the .onnx model.")
+    trt_p.add_argument("--engine", type=pathlib.Path, default=None, help="Output .engine path (default: <onnx_stem>.engine).")
+    trt_p.add_argument("--trt-fp16", action="store_true", help="Enable FP16 precision.")
+    trt_p.add_argument("--trt-int8", action="store_true", help="Enable INT8 precision (needs calibrator for best results).")
+    trt_p.add_argument("--min-batch", type=int, default=1, help="Min batch size for TRT profile (default: 1).")
+    trt_p.add_argument("--opt-batch", type=int, default=1, help="Optimal batch size for TRT profile (default: 1).")
+    trt_p.add_argument("--max-batch", type=int, default=16, help="Max batch size for TRT profile (default: 16).")
+    trt_p.add_argument("--workspace-gib", type=int, default=2, help="TRT workspace memory in GiB (default: 2).")
+
+    args = p.parse_args()
+
+    if args.command == "onnx":
+        return _cmd_onnx(args)
+    if args.command == "trt":
+        return _cmd_trt(args)
+    return 1
 
 
 if __name__ == "__main__":

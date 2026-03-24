@@ -99,6 +99,7 @@ def main() -> int:
     input_name = sess.get_inputs()[0].name
     output_names = [o.name for o in sess.get_outputs()]
     has_region = "region" in output_names and regions
+    # detect the layout of the input tensor like NCHW or NHWC
     layout = detect_layout(sess)
 
     image_paths = sorted(
