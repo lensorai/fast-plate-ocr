@@ -29,14 +29,26 @@ DEFAULT_FOLDER = Path(
     "/Users/anwesh.marwade@pon.com/repos/ai-library/src/ai_library/assets/dekra_images_debug/dekra_images_crop"
 )
 
-TRT_TO_TORCH_DTYPE = {
-    0: torch.float32,   # trt.float32
-    1: torch.float16,   # trt.float16
-    2: torch.int8,      # trt.int8
-    3: torch.int32,     # trt.int32
-    4: torch.bool,      # trt.bool
-    6: torch.float16,   # trt.bf16 → closest common fallback
-}
+def _build_trt_to_torch_map():
+    """Build TRT DataType → torch.dtype map at runtime so it works across TRT versions."""
+    import tensorrt as trt
+
+    mapping: dict[trt.DataType, torch.dtype] = {}
+    _candidates = {
+        "FLOAT": torch.float32,
+        "HALF": torch.float16,
+        "INT8": torch.int8,
+        "INT32": torch.int32,
+        "INT64": torch.int64,
+        "BOOL": torch.bool,
+        "BF16": torch.bfloat16,
+        "FP8": torch.float8_e4m3fn,
+        "UINT8": torch.uint8,
+    }
+    for attr, torch_dt in _candidates.items():
+        if hasattr(trt.DataType, attr):
+            mapping[getattr(trt.DataType, attr)] = torch_dt
+    return mapping
 
 
 # ── TensorRT runtime wrapper ────────────────────────────────────────────────
@@ -49,6 +61,7 @@ class TRTRunner:
         import tensorrt as trt
 
         self._trt = trt
+        self._dtype_map = _build_trt_to_torch_map()
         self.device = torch.device(device)
         self.stream = torch.cuda.Stream(self.device)
 
@@ -56,6 +69,12 @@ class TRTRunner:
         runtime = trt.Runtime(self.logger)
         with open(engine_path, "rb") as f:
             self.engine = runtime.deserialize_cuda_engine(f.read())
+        if self.engine is None:
+            raise RuntimeError(
+                f"Failed to deserialize engine from {engine_path}. "
+                "Ensure the engine was built with the same TensorRT version "
+                f"(currently {trt.__version__})."
+            )
         self.context = self.engine.create_execution_context()
 
         self.input_names: list[str] = []
@@ -69,7 +88,7 @@ class TRTRunner:
 
     def _expected_torch_dtype(self, tensor_name: str) -> torch.dtype:
         trt_dtype = self.engine.get_tensor_dtype(tensor_name)
-        return TRT_TO_TORCH_DTYPE.get(int(trt_dtype), torch.float32)
+        return self._dtype_map.get(trt_dtype, torch.float32)
 
     def infer(self, inputs: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
         """
@@ -96,7 +115,7 @@ class TRTRunner:
             for name in self.output_names:
                 shape = tuple(self.context.get_tensor_shape(name))
                 trt_dtype = self.engine.get_tensor_dtype(name)
-                torch_dtype = TRT_TO_TORCH_DTYPE.get(int(trt_dtype), torch.float32)
+                torch_dtype = self._dtype_map.get(trt_dtype, torch.float32)
                 d_outputs[name] = torch.empty(shape, dtype=torch_dtype, device=self.device)
                 self.context.set_tensor_address(name, d_outputs[name].data_ptr())
 

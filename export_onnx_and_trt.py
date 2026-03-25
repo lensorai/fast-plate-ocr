@@ -191,8 +191,9 @@ def build_trt_engine(
         sys.exit(1)
 
     trt_logger = trt.Logger(trt.Logger.INFO)
+    log.info("TensorRT version: %s", trt.__version__)
     builder = trt.Builder(trt_logger)
-    network = builder.create_network(1 << int(trt.NetworkDefinitionCreationFlag.EXPLICIT_BATCH))
+    network = builder.create_network()
     parser = trt.OnnxParser(network, trt_logger)
 
     log.info("Parsing ONNX model: %s", onnx_path)

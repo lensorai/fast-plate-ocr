@@ -87,6 +87,13 @@ docs = [
     "mike",
 ]
 
+trt-inference = [
+    "tensorrt>=10.12.0,<10.13",
+    "torch",
+    "pyyaml>=5.1",
+    "opencv-python-headless",
+]
+
 [tool.uv]
 default-groups = [
     "test",
