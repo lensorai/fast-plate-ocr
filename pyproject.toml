@@ -40,10 +40,11 @@ dependencies = [
 
 [project.optional-dependencies]
 onnx = ["onnxruntime"]
-onnx-gpu = ["onnxruntime-gpu"]
-onnx-openvino = ["onnxruntime-openvino"]
-onnx-directml = ["onnxruntime-directml"]
-onnx-qnn = ["onnxruntime-qnn"]
+onnx-macos = ["onnxruntime"]
+onnx-gpu = ["onnxruntime-gpu; sys_platform != 'darwin'"]
+# onnx-openvino = ["onnxruntime-openvino"]
+onnx-directml = ["onnxruntime-directml; sys_platform == 'win32'"]
+# onnx-qnn = ["onnxruntime-qnn"]
 train = [
     "ai-edge-litert",
     "albumentations",
@@ -84,6 +85,13 @@ docs = [
     "mkdocs-material",
     "mkdocstrings[python]",
     "mike",
+]
+
+trt-inference = [
+    "tensorrt>=10.12.0,<10.13",
+    "torch",
+    "pyyaml>=5.1",
+    "opencv-python-headless",
 ]
 
 [tool.uv]
